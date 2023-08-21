@@ -1,96 +1,263 @@
+{ localSystem ? { system = builtins.currentSystem; }
+}:
+
 rec {
-  ledger-platform = import ./dep/ledger-platform {};
+  alamgu = import ./dep/alamgu { inherit localSystem; };
 
-  inherit (ledger-platform)
-    lib
-    pkgs ledgerPkgs
-    crate2nix
-    buildRustCrateForPkgsLedger;
+  inherit (alamgu) lib pkgs crate2nix alamguLib;
 
-  app = import ./Cargo.nix {
-    pkgs = ledgerPkgs;
-    buildRustCrateForPkgs = pkgs: let
-      fun = (buildRustCrateForPkgsLedger pkgs).override {
-        defaultCrateOverrides = pkgs.defaultCrateOverrides // {
-          kadena = attrs: let
-            sdk = lib.findFirst (p: lib.hasPrefix "rust_nanos_sdk" p.name) (builtins.throw "no sdk!") attrs.dependencies;
-          in {
-            preHook = ledger-platform.gccLibsPreHook;
-            extraRustcOpts = attrs.extraRustcOpts or [] ++ [
-              "-C" "link-arg=-T${sdk.lib}/lib/nanos_sdk.out/script.ld"
-              "-C" "linker=${pkgs.stdenv.cc.targetPrefix}lld"
-            ];
-          };
-        };
-      };
-    in
-      args: fun (args // lib.optionalAttrs pkgs.stdenv.hostPlatform.isAarch32 {
-        RUSTC_BOOTSTRAP = true;
-        extraRustcOpts = [
-          "-C" "relocation-model=ropi"
-          "-C" "passes=ledger-ropi"
-        ] ++ args.extraRustcOpts or [];
-        dependencies = map (d: d // { stdlib = true; }) [
-          ledger-platform.ledgerCore
-          ledger-platform.ledgerCompilerBuiltins
-        ] ++ args.dependencies;
-      });
+  appName = "kadena";
+
+  app-nix = alamgu.crate2nix-tools.generatedCargoNix {
+    name = "${appName}-nix";
+    src = builtins.filterSource (p: _: p != toString "./rust-app/target") ./rust-app;
+    additionalCrateHashes = builtins.fromJSON (builtins.readFile ./crate-hashes.json);
   };
 
-  # For CI
-  rootCrate = app.rootCrate.build;
+  makeLinkerScript = { pkgs, sdkSrc }:
+    pkgs.stdenvNoCC.mkDerivation {
+      name = "alamgu-linker-wrapper";
+      dontUnpack = true;
+      dontBuild = true;
+      installPhase = ''
+        mkdir -p "$out/bin"
+        cp "${sdkSrc}/scripts/link_wrap.sh" "$out/bin"
+        chmod +x "$out/bin/link_wrap.sh"
+      '';
+    };
 
-  tarSrc = ledgerPkgs.runCommandCC "tarSrc" {
+  makeApp = { rootFeatures ? [ "default" ], release ? true, device }:
+    let collection = alamgu.perDevice.${device};
+    in import app-nix {
+      inherit rootFeatures release;
+      pkgs = collection.ledgerPkgs;
+      buildRustCrateForPkgs = alamguLib.combineWrappers [
+        # The callPackage of `buildRustPackage` overridden with various
+        # modified arguemnts.
+        (pkgs: (collection.buildRustCrateForPkgsLedger pkgs).override {
+          defaultCrateOverrides = pkgs.defaultCrateOverrides // {
+            nanos_sdk = attrs: {
+              passthru = (attrs.passthru or {}) // {
+                link_wrap = makeLinkerScript {
+                  pkgs = pkgs.buildPackages;
+                  sdkSrc = attrs.src;
+                };
+              };
+            };
+            ${appName} = attrs: let
+              sdk = lib.findFirst (p: lib.hasPrefix "rust_nanos_sdk" p.name) (builtins.throw "no sdk!") attrs.dependencies;
+            in {
+              preHook = collection.gccLibsPreHook;
+              extraRustcOpts = attrs.extraRustcOpts or [] ++ [
+                "-C" "linker=${sdk.link_wrap}/bin/link_wrap.sh"
+                "-C" "link-arg=-T${sdk.lib}/lib/nanos_sdk.out/link.ld"
+                "-C" "link-arg=-T${sdk.lib}/lib/nanos_sdk.out/${device}_layout.ld"
+              ];
+              passthru = (attrs.passthru or {}) // { inherit sdk; };
+            };
+          };
+        })
+
+        # Default Alamgu wrapper
+        alamguLib.extraArgsForAllCrates
+
+        # Another wrapper specific to this app, but applying to all packages
+        (pkgs: args: args // lib.optionalAttrs (alamguLib.platformIsBolos pkgs.stdenv.hostPlatform) {
+          dependencies = map (d: d // { stdlib = true; }) [
+            collection.ledgerCore
+            collection.ledgerCompilerBuiltins
+          ] ++ args.dependencies;
+        })
+      ];
+  };
+
+  makeArchiveSource = { appExe, device }:
+  let collection = alamgu.perDevice.${device};
+  in collection.ledgerPkgs.runCommandCC "${appName}-${device}-tar-src" {
     nativeBuildInputs = [
-      ledger-platform.cargo-ledger
-      ledger-platform.ledgerRustPlatform.rust.cargo
+      alamgu.cargo-ledger
+      alamgu.ledgerRustPlatform.rust.cargo
     ];
-  } (ledger-platform.cargoLedgerPreHook + ''
+    strictDeps = true;
+  } (alamgu.cargoLedgerPreHook + ''
 
     cp ${./rust-app/Cargo.toml} ./Cargo.toml
     # So cargo knows it's a binary
     mkdir src
     touch src/main.rs
 
-    cargo-ledger --use-prebuilt ${rootCrate}/bin/kadena --hex-next-to-json
+    cargo-ledger --use-prebuilt ${appExe} --hex-next-to-json ledger ${device}
 
-    mkdir -p $out/kadena
-    cp app.json app.hex $out/kadena
-    cp ${./tarball-default.nix} $out/kadena/default.nix
-    cp ${./rust-app/kadena.gif} $out/kadena/kadena.gif
+    dest=$out/${appName}-${device}
+    mkdir -p $dest/dep
+
+    # Copy Alamgu build infra thunk
+    cp -r ${./dep/alamgu} $dest/dep/alamgu
+
+    # Create a file to indicate what device this is for
+    echo ${device} > $dest/device
+    cp app_${device}.json $dest/app.json
+    cp app.hex $dest
+    cp ${./tarball-default.nix} $dest/default.nix
+    cp ${./tarball-shell.nix} $dest/shell.nix
+    cp ${./rust-app/kadena.gif} $dest/kadena.gif
+    cp ${./rust-app/kadena-small.gif} $dest/kadena-small.gif
   '');
 
-  tarball = pkgs.runCommandNoCC "app-tarball.tar.gz" { } ''
-    tar -czvhf $out -C ${tarSrc} kadena
-  '';
+  inherit
+    (import ./ts-tests { inherit pkgs; })
+    testModules
+    testScript
+    testPackage
+    ;
 
-  testPackage = (import ./ts-tests/override.nix { inherit pkgs; }).package;
+  apiPort = 5005;
 
-  runTests = { appExe ? rootCrate + "/bin/kadena" }: pkgs.runCommandNoCC "run-tests" {
+  # Tests don't yet run on Darwin
+  runTests = { appExe, device, variant ? "", speculosCmd }:
+  if pkgs.stdenv.hostPlatform.isDarwin
+  then null
+  else
+  pkgs.runCommandNoCC "run-tests-${device}${variant}" {
     nativeBuildInputs = [
-      pkgs.wget ledger-platform.speculos.speculos pkgs.coreutils testPackage pkgs.nodejs-12_x
+      pkgs.wget alamgu.speculos.speculos testScript
     ];
+    strictDeps = true;
   } ''
-    RUST_APP=${rootCrate}/bin/*
-    echo RUST APP IS $RUST_APP
-    # speculos -k 2.0 $RUST_APP --display headless &
     mkdir $out
     (
-    speculos -k 2.0 ${appExe} --display headless &
+    set +e # Dont exit on error, do the cleanup/kill of background processes
+    ${toString speculosCmd} ${appExe} --display headless &
     SPECULOS=$!
 
-    until wget -O/dev/null -o/dev/null http://localhost:5000; do sleep 0.1; done;
+    until wget -O/dev/null -o/dev/null http://localhost:${toString apiPort}; do sleep 0.1; done;
 
-    pushd ${testPackage}/lib/node_modules/*/
-    NO_UPDATE_NOTIFIER=true npm --offline test
+    ${testScript}/bin/mocha-wrapper
     rv=$?
-    popd
-    kill $SPECULOS
-    exit $rv) | tee $out/short |& tee $out/full
+    kill -9 $SPECULOS
+    exit $rv) | tee $out/short |& tee $out/full &
+    TESTS=$!
+    (sleep 3m; kill $TESTS) &
+    TESTKILLER=$!
+    wait $TESTS
     rv=$?
+    kill $TESTKILLER
     cat $out/short
     exit $rv
   '';
+
+  makeStackCheck = { rootCrate, device, memLimit, variant ? "" }:
+  pkgs.runCommandNoCC "stack-check-${device}${variant}" {
+    nativeBuildInputs = [ alamgu.stack-sizes ];
+    strictDeps = true;
+  } ''
+    stack-sizes --mem-limit=${toString memLimit} ${rootCrate}/bin/${appName} ${rootCrate}/bin/*.o | tee $out
+  '';
+
+  appForDevice = device: rec {
+    app = makeApp { inherit device; };
+    app-with-logging = makeApp {
+      inherit device;
+      release = false;
+      rootFeatures = [ "default" "speculos" "extra_debug" ];
+    };
+
+    memLimit = {
+      nanos = 4500;
+      nanosplus = 400000;
+      nanox = 400000;
+    }.${device} or (throw "Unknown target device: `${device}'");
+
+    stack-check = makeStackCheck { inherit memLimit rootCrate device; };
+    stack-check-with-logging = makeStackCheck {
+      inherit memLimit device;
+      rootCrate = rootCrate-with-logging;
+      variant = "-with-logging";
+    };
+
+    rootCrate = app.rootCrate.build;
+    rootCrate-with-logging = app-with-logging.rootCrate.build;
+
+    appExe = rootCrate + "/bin/" + appName;
+
+    rustShell = alamgu.perDevice.${device}.rustShell.overrideAttrs (old: {
+      nativeBuildInputs = old.nativeBuildInputs ++ [
+        pkgs.yarn
+        pkgs.wget
+        (makeLinkerScript {
+          inherit pkgs;
+          sdkSrc = alamgu.thunkSource ./dep/ledger-nanos-sdk;
+        })
+      ];
+    });
+
+    archiveSource = makeArchiveSource { inherit appExe device; };
+
+    tarball = pkgs.runCommandNoCC "${appName}-${device}.tar.gz" {} ''
+      dir="${appName}-${device}"
+      cp -r "${archiveSource}/$dir" ./
+      chmod -R ugo+w "$dir"
+      tar -czvhf $out -C . "${appName}-${device}"
+    '';
+
+    zip = pkgs.runCommandNoCC "${appName}-${device}.zip" {
+      nativeBuildInputs = [ pkgs.zip ];
+    } ''
+      dir="${appName}-${device}"
+      cp -r "${archiveSource}/$dir" ./
+      chmod -R ugo+w "$dir"
+      zip -r $out "${appName}-${device}"
+    '';
+
+    loadApp = pkgs.writeScriptBin "load-app" ''
+      #!/usr/bin/env bash
+      cd ${archiveSource}/${appName}-${device}
+      ${alamgu.ledgerctl}/bin/ledgerctl install -f ${archiveSource}/${appName}-${device}/app.json
+    '';
+
+    tarballShell = import (archiveSource + "/${appName}-${device}/shell.nix");
+
+    speculosDeviceFlags = {
+      nanos = [ "-m" "nanos" ];
+      nanosplus = [ "-m" "nanosp" "-a" "1" ];
+      nanox = [ "-m" "nanox" "-a" "5" ];
+    }.${device} or (throw "Unknown target device: `${device}'");
+
+    speculosCmd = [
+      "speculos"
+      "--api-port" (toString apiPort)
+    ] ++ speculosDeviceFlags;
+
+    test = runTests { inherit appExe speculosCmd device; };
+    test-with-logging = runTests {
+      inherit speculosCmd device;
+      appExe = rootCrate-with-logging + "/bin/" + appName;
+      variant = "-with-logging";
+    };
+
+    appShell = pkgs.mkShell {
+      packages = [ alamgu.ledgerctl loadApp alamgu.generic-cli pkgs.jq ];
+    };
+  };
+
+  nanos = appForDevice "nanos";
+  nanosplus = appForDevice "nanosplus";
+  nanox = appForDevice "nanox";
+
+  cargoFmtCheck = pkgs.stdenv.mkDerivation {
+    pname = "cargo-fmt-${appName}";
+    inherit (nanos.rootCrate) version src;
+    nativeBuildInputs = [
+      pkgs.alamguRustPackages.cargo
+      pkgs.alamguRustPackages.rustfmt
+    ];
+    buildPhase = ''
+      cargo fmt --all --check
+    '';
+    installPhase = ''
+      touch "$out"
+    '';
+  };
 
   inherit (pkgs.nodePackages) node2nix;
 }
